@@ -287,8 +287,6 @@ def index():
 
 @app.route('/ask', methods=['POST'])
 def ask():
-    # 这个后端的逻辑与我们之前的 `genie_app_pat_final.py` 版本几乎完全相同
-    # 它负责连接 Databricks API 并取回格式化好的文本数据
     if not all([DATABRICKS_HOST, GENIE_SPACE_ID, DATABRICKS_TOKEN]):
         return jsonify({"error": "Server is not configured. Missing environment variables."}), 500
     user_question = request.json.get('question')
@@ -317,38 +315,52 @@ def ask():
             status = poll_data.get('status')
         
         if status == 'COMPLETED':
-            if 'attachments' in poll_data and len(poll_data['attachments']) > 0 and 'query' in poll_data['attachments'][0] and 'statement_id' in poll_data['attachments'][0]['query']:
-                statement_id = poll_data['attachments'][0]['query']['statement_id']
+            # --- 从这里开始是修改后的逻辑 ---
+            answer_parts = []
+            
+            # 遍历所有附件，收集文本和数据
+            for attachment in poll_data.get('attachments', []):
+                # 1. 如果是文本附件，直接添加
+                if 'text' in attachment:
+                    answer_parts.append(attachment['text'])
                 
-                results_url = f"{DATABRICKS_HOST}/api/2.0/sql/statements/{statement_id}"
-                results_response = requests.get(results_url, headers=headers)
-                results_response.raise_for_status()
-                results_data = results_response.json()
+                # 2. 如果是数据查询附件，获取数据并格式化为表格
+                if 'query' in attachment and 'statement_id' in attachment['query']:
+                    statement_id = attachment['query']['statement_id']
+                    results_url = f"{DATABRICKS_HOST}/api/2.0/sql/statements/{statement_id}"
+                    results_response = requests.get(results_url, headers=headers)
+                    
+                    if results_response.status_code == 200:
+                        results_data = results_response.json()
+                        # 确保有数据可供格式化
+                        if 'result' in results_data and 'data_array' in results_data['result'] and len(results_data['result']['data_array']) > 0:
+                            columns = [col['name'] for col in results_data['manifest']['schema']['columns']]
+                            data_array = results_data['result']['data_array']
+                            
+                            header = " | ".join(columns)
+                            separator = " | ".join(["---"] * len(columns))
+                            rows = [" | ".join(map(str, row)) for row in data_array]
+                            
+                            table_text = "\n".join([header, separator] + rows)
+                            answer_parts.append(table_text)
 
-                # 将数据格式化为文本表格，返回给前端
-                columns = [col['name'] for col in results_data['manifest']['schema']['columns']]
-                data_array = results_data['result']['data_array']
-                header = " | ".join(columns)
-                separator = " | ".join(["---"] * len(columns))
-                rows = [" | ".join(map(str, row)) for row in data_array]
-                answer_text = "\n".join([header, separator] + rows)
-                
-                return jsonify({'answer': answer_text})
+            # 将收集到的所有部分用换行符连接起来
+            # 如果什么都没有，就返回一个默认消息
+            if answer_parts:
+                final_answer = "\n\n".join(answer_parts)
+                return jsonify({'answer': final_answer})
             else:
-                # 如果没有返回数据，返回一个友好的文本消息
-                # 检查是否有文本类型的附件
-                text_answer = "I've processed your request, but there's no data table to show."
-                for att in poll_data.get('attachments', []):
-                    if 'text' in att:
-                        text_answer = att['text']
-                        break
-                return jsonify({'answer': text_answer})
+                return jsonify({'answer': "I've processed your request, but couldn't find a specific answer or data."})
+            # --- 修改逻辑结束 ---
+
         else:
             return jsonify({'error': f'Failed to get answer. Final status: {status}', 'details': poll_data.get('error')}), 500
     except requests.exceptions.HTTPError as e:
         return jsonify({'error': f"HTTP Error: {e.response.status_code}", 'details': e.response.text}), 500
     except Exception as e:
         return jsonify({'error': f'An unexpected server error occurred: {str(e)}'}), 500
+
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
